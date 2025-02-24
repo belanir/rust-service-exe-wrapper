@@ -1,14 +1,15 @@
 use clap::{Parser, Subcommand};
 use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
 use std::process::{Child, Command};
 use std::sync::mpsc::channel;
 use std::time::Duration;
 use windows_service::{
     service::{
-        ServiceAccess, ServiceControlAccept, ServiceControlHandlerResult, ServiceErrorControl,
-        ServiceInfo, ServiceStartType, ServiceStatus, ServiceState, ServiceType,
+        ServiceAccess, ServiceControlAccept, ServiceErrorControl, ServiceInfo, ServiceStartType,
+        ServiceStatus, ServiceState, ServiceType,
     },
-    service_control_handler,
+    service_control_handler::{self, ServiceControlHandlerResult},
     service_dispatcher,
     service_manager::{ServiceManager, ServiceManagerAccess},
 };
@@ -63,8 +64,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Service '{}' uninstalled successfully.", name);
         }
         None => {
-            // When no subcommand is provided, we assume the executable is running as a service.
-            // The service control manager (SCM) will pass the launch arguments.
+            // When no subcommand is provided, assume we're running as a service.
+            // The service control manager (SCM) will pass raw launch arguments.
             service_dispatcher::start(&cli.name, service_main)?;
         }
     }
@@ -82,7 +83,7 @@ fn install_service(service_name: &str, bat_path: &str) -> Result<(), Box<dyn std
         start_type: ServiceStartType::Automatic,
         error_control: ServiceErrorControl::Normal,
         executable_path: current_exe.clone(),
-        // Pass the --name and --bat parameters so they are available when the service starts.
+        // Pass the --name and --bat parameters so they're available when the service starts.
         launch_arguments: vec![
             OsString::from("--name"),
             OsString::from(service_name),
@@ -109,19 +110,44 @@ fn uninstall_service(service_name: &str) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// Entry point for the service. The SCM calls this function and passes the launch arguments.
-fn service_main(arguments: Vec<OsString>) {
-    // Parse the launch arguments provided by Windows SCM.
-    let cli = Cli::parse_from(arguments);
+/// The service entry point with the expected signature.
+/// Converts raw Windows arguments into a Vec<OsString> for clap parsing.
+extern "system" fn service_main(argc: u32, argv: *mut *mut u16) {
+    let args = raw_args_to_vec(argc, argv);
+    let cli = Cli::parse_from(args);
     if let Err(e) = run_service(&cli) {
         eprintln!("Service error: {}", e);
     }
 }
 
-/// Runs the service logic. This function registers a control handler, spawns the batch file,
-/// and waits for STOP, PAUSE, or CONTINUE commands. On STOP, it kills the batch process.
+/// Helper function to convert raw Windows arguments (wide strings) into a Vec<OsString>.
+fn raw_args_to_vec(argc: u32, argv: *mut *mut u16) -> Vec<OsString> {
+    let mut args = Vec::with_capacity(argc as usize);
+    if argv.is_null() {
+        return args;
+    }
+    for i in 0..argc {
+        unsafe {
+            let ptr = *argv.add(i as usize);
+            if ptr.is_null() {
+                continue;
+            }
+            // Find the length of the null-terminated wide string.
+            let mut len = 0;
+            while *ptr.add(len) != 0 {
+                len += 1;
+            }
+            let slice = std::slice::from_raw_parts(ptr, len);
+            args.push(OsString::from_wide(slice));
+        }
+    }
+    args
+}
+
+/// Runs the service logic. Registers a control handler, spawns the batch file,
+/// and waits for STOP, PAUSE, or CONTINUE commands. On STOP, the batch process is killed.
 fn run_service(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    // Create a channel to receive control commands.
+    // Create a channel to receive control signals.
     let (control_tx, control_rx) = channel();
 
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
@@ -165,29 +191,11 @@ fn run_service(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let control_signal = control_rx.recv().unwrap();
     match control_signal {
         "stop" => {
-            // When STOP is received, kill the batch process.
+            // Kill the batch process on STOP.
             let _ = child.kill();
             // Report that the service has stopped.
             status_handle.set_service_status(ServiceStatus {
                 service_type: ServiceType::OWN_PROCESS,
                 current_state: ServiceState::Stopped,
                 controls_accepted: ServiceControlAccept::empty(),
-                checkpoint: 0,
-                wait_hint: Duration::from_secs(5),
-                process_id: None,
-            })?;
-        }
-        "pause" => {
-            // For demonstration purposes, we simply log the pause event.
-            eprintln!("Service paused. (Note: pausing a batch process is not directly supported.)");
-            // You could implement additional logic here if you need to handle pausing.
-        }
-        "continue" => {
-            // Log resume event.
-            eprintln!("Service resumed.");
-            // Implement resume logic as needed.
-        }
-        _ => {}
-    }
-    Ok(())
-}
+                chec
