@@ -198,4 +198,18 @@ fn run_service(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 service_type: ServiceType::OWN_PROCESS,
                 current_state: ServiceState::Stopped,
                 controls_accepted: ServiceControlAccept::empty(),
-                chec
+                checkpoint: 0,
+                wait_hint: Duration::from_secs(5),
+                process_id: None,
+            })?;
+        }
+        "pause" => {
+            eprintln!("Service paused. (Pausing a batch process is not directly supported.)");
+        }
+        "continue" => {
+            eprintln!("Service resumed.");
+        }
+        _ => {}
+    }
+    Ok(())
+}
