@@ -19,6 +19,7 @@ use windows_service::{
     service_dispatcher,
     service_manager::{ServiceManager, ServiceManagerAccess},
 };
+use crate::job::Job;
 
 static CLI: once_cell::sync::Lazy<Arc<Mutex<Option<Cli>>>> = once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
 
@@ -116,7 +117,7 @@ fn install_service(service_name: &str, bat_path: &str) -> Result<(), Box<dyn std
 
     let service_manager = ServiceManager::local_computer(
         None::<&str>,
-        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE
+        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )?;
     let _service = service_manager.create_service(&service_info, ServiceAccess::empty())?;
     info!("Service '{}' installed successfully.", service_name);
@@ -203,11 +204,19 @@ fn run_service(service_name: &str, bat_path: &str) -> Result<(), Box<dyn std::er
         process_id: Some(std::process::id()),
     })?;
 
+
+    // Create a job object to manage the child process tree
+    #[cfg(windows)]
+    let job = Job::new()?;
+
+
     let mut child = Command::new("cmd.exe")
-        .args(&["/K", bat_path])
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .args(&["/C", bat_path])
         .spawn()?;
+
+    // Assign the child process to the job object
+    #[cfg(windows)]
+    job.assign_process(&child)?;
 
     info!("Batch file '{}' started successfully.", bat_path);
 
@@ -221,7 +230,7 @@ fn run_service(service_name: &str, bat_path: &str) -> Result<(), Box<dyn std::er
         process_id: Some(std::process::id()),
     })?;
 
-    let stop_requested = wait_for_stop_signal(&control_rx, &mut child);
+    let stop_requested = wait_for_stop_signal(&control_rx, &mut child, Some(job));
 
     if stop_requested {
         info!("Stop signal received; child process was terminated.");
@@ -245,13 +254,19 @@ fn run_service(service_name: &str, bat_path: &str) -> Result<(), Box<dyn std::er
 
 /// Polls for either a stop signal from the service control or for the child process
 /// to finish naturally. No additional thread is spawned here.
-fn wait_for_stop_signal(control_rx: &Receiver<&str>, child: &mut Child) -> bool {
+fn wait_for_stop_signal(control_rx: &Receiver<&str>, child: &mut Child, job: Option<Job>) -> bool {
     loop {
         // If a stop signal is received, kill the child process.
         if let Ok("stop") = control_rx.try_recv() {
             info!("Stop signal received from service control; terminating child process...");
             let _ = child.kill();
             let _ = child.wait();
+
+            if let Some(job) = job {
+                let _ = job.terminate();
+            }
+
+
             return true;
         }
         // If the child process has finished naturally, return immediately.
@@ -261,5 +276,74 @@ fn wait_for_stop_signal(control_rx: &Receiver<&str>, child: &mut Child) -> bool 
         }
         info!("Service running...");
         thread::sleep(Duration::from_secs(1));
+    }
+}
+
+//JOB AREA
+#[cfg(windows)]
+mod job {
+    use std::io;
+    use std::ptr;
+    use std::os::windows::io::AsRawHandle;
+    use winapi::um::jobapi2::{CreateJobObjectW, AssignProcessToJobObject, TerminateJobObject, SetInformationJobObject};
+    use winapi::um::winnt::{JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JobObjectExtendedLimitInformation};
+    use winapi::shared::minwindef::DWORD;
+
+    pub struct Job {
+        handle: winapi::um::winnt::HANDLE,
+    }
+
+    impl Job {
+        pub fn new() -> io::Result<Self> {
+            unsafe {
+                let handle = CreateJobObjectW(ptr::null_mut(), ptr::null());
+                if handle.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+
+                // Set the JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE flag
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let result = SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    &mut info as *mut _ as *mut _,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as DWORD,
+                );
+                if result == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(Job { handle })
+            }
+        }
+
+        pub fn assign_process<P: AsRawHandle>(&self, process: &P) -> io::Result<()> {
+            unsafe {
+                let result = AssignProcessToJobObject(self.handle, process.as_raw_handle());
+                if result == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        }
+
+        pub fn terminate(&self) -> io::Result<()> {
+            unsafe {
+                let result = TerminateJobObject(self.handle, 1);
+                if result == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // When the job object is dropped, all associated processes are terminated
+            unsafe {
+                TerminateJobObject(self.handle, 1);
+            }
+        }
     }
 }
